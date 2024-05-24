@@ -14,7 +14,10 @@
 */
 
 #include <llvm/Analysis/TargetLibraryInfo.h>
+#include <llvm/CodeGen/ISDOpcodes.h>
 #include <llvm/CodeGen/MIRPrinter.h>
+#include <llvm/CodeGen/MachineBasicBlock.h>
+#include <llvm/CodeGen/MachineFunction.h>
 #include <llvm/CodeGen/MachineFunctionPass.h>
 #include <llvm/CodeGen/MachineModuleInfo.h>
 #include <llvm/CodeGen/Passes.h>
@@ -63,6 +66,8 @@
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/TargetParser/Host.h>
+#include <llvm/lib/Target/RISCV/RISCVInstrInfo.h>
+#include <llvm/lib/Target/RISCV/RISCVRegisterInfo.h>
 #include <cstdlib>
 
 using namespace llvm;
@@ -95,9 +100,10 @@ struct RISCVLiftPass : public MachineFunctionPass {
   static char ID;
   Module &RefM;
   Module &M;
+  uint32_t XLen;
 
-  RISCVLiftPass(Module &RefM, Module &M)
-      : MachineFunctionPass(ID), RefM(RefM), M(M) {}
+  explicit RISCVLiftPass(Module &RefM, Module &M, uint32_t XLen)
+      : MachineFunctionPass(ID), RefM(RefM), M(M), XLen(XLen) {}
 
   StringRef getPassName() const override {
     return "RISCV MIR -> LLVM IR Lifting Pass";
@@ -108,12 +114,154 @@ struct RISCVLiftPass : public MachineFunctionPass {
     MachineFunctionPass::getAnalysisUsage(AU);
   }
 
-  bool doFinalization(Module &M) override { return verifyModule(M, &errs()); }
+  bool doFinalization(Module &M) override { return false; }
 
-  bool runOnMachineFunction(MachineFunction &MF) override { return false; }
+  Type *getTypeFromRegClass(const TargetRegisterClass *RC) {
+    if (RC == &RISCV::GPRRegClass)
+      return Type::getIntNTy(M.getContext(), XLen);
+
+    llvm_unreachable("Unsupported register class");
+  }
+
+  bool runOnMachineFunction(MachineFunction &MF) override {
+    assert(MF.getProperties().hasProperty(
+               MachineFunctionProperties::Property::IsSSA) &&
+           "MachineFunction is not in SSA form");
+
+    auto *RefF = RefM.getFunction(MF.getName());
+    if (!RefF) {
+      errs() << "Function " << MF.getName()
+             << " not found in reference module\n";
+      return true;
+    }
+
+    auto *F = cast<Function>(
+        M.getOrInsertFunction(MF.getName(), RefF->getFunctionType())
+            .getCallee());
+    F->copyAttributesFrom(RefF);
+
+    // MF.print(errs());
+    // errs() << '\n';
+
+    MachineRegisterInfo &MRI = MF.getRegInfo();
+    const TargetRegisterInfo &TRI = *static_cast<const RISCVRegisterInfo *>(
+        MF.getSubtarget().getRegisterInfo());
+
+    for (auto &MBB : MF) {
+      auto *BB = BasicBlock::Create(M.getContext(), MBB.getName(), F);
+      IRBuilder<> Builder(BB);
+
+      DenseMap<Register, Value *> RegMap;
+      DenseMap<Register, Value *> RetMap;
+
+      for (auto &MI : MBB) {
+        auto GetOperand = [&](uint32_t Id) {
+          auto &Reg = MI.getOperand(Id);
+          assert(Reg.isUse() && "Operand is not a use");
+          return RegMap.at(Reg.getReg());
+        };
+
+        auto SetRes = [&](Value *Val) {
+          auto &Reg = MI.getOperand(0);
+          assert(Reg.isDef() && "Operand is not a def");
+          RegMap[Reg.getReg()] = Val;
+        };
+
+        auto TruncW = [&](uint32_t Id) {
+          return Builder.CreateTrunc(GetOperand(Id), Builder.getInt32Ty());
+        };
+
+        auto SExtW = [&](Value *Val) {
+          return Builder.CreateSExt(Val, Builder.getIntNTy(XLen));
+        };
+
+        auto ZExtW = [&](Value *Val) {
+          return Builder.CreateZExt(Val, Builder.getIntNTy(XLen));
+        };
+
+        switch (MI.getOpcode()) {
+        case TargetOpcode::COPY: {
+          auto &Dst = MI.getOperand(0);
+          auto &Src = MI.getOperand(1);
+
+          // auto *RegClass = MRI.getRegClass(Src.getReg());
+          // Type *Ty = getTypeFromRegClass(RegClass);
+          Value *Val = nullptr;
+
+          if (Src.getReg().isPhysical()) {
+            auto Id = Src.getReg().id();
+            if (Id >= RISCV::X10 && Id <= RISCV::X14)
+              Val = F->getArg(Src.getReg().id() - RISCV::X10);
+            else
+              llvm_unreachable("Unsupported argument");
+          } else
+            Val = RegMap.at(Src.getReg());
+
+          Type *TgtTy = nullptr;
+
+          if (Dst.getReg().isPhysical()) {
+            TgtTy = Builder.getIntNTy(XLen);
+          } else {
+            TgtTy = getTypeFromRegClass(MRI.getRegClass(Dst.getReg()));
+          }
+
+          if (Val->getType() != TgtTy)
+            Val = Builder.CreateIntCast(Val, TgtTy, /*isSigned=*/true);
+
+          if (Dst.getReg().isPhysical())
+            RetMap[Dst.getReg()] = Val;
+          else
+            RegMap[Dst.getReg()] = Val;
+
+          break;
+        }
+        case RISCV::PseudoRET: {
+          if (F->getReturnType()->isVoidTy()) {
+            Builder.CreateRetVoid();
+          } else {
+            auto &Ret = MI.getOperand(0);
+            assert(Ret.isUse() && "Operand is not a use");
+            assert(Ret.isImplicit() && "Operand is not implicit");
+            auto *Val = RetMap.at(Ret.getReg());
+            Builder.CreateRet(
+                Builder.CreateTruncOrBitCast(Val, F->getReturnType()));
+          }
+          break;
+        }
+        case RISCV::ADDW:
+          SetRes(SExtW(Builder.CreateAdd(TruncW(1), TruncW(2))));
+          break;
+        default:
+          errs() << "Unsupported opcode: " << MI << '\n';
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
 };
 
 char RISCVLiftPass::ID;
+
+static void runOpt(Module &M) {
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+
+  llvm::PassBuilder PB;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  llvm::ModulePassManager MPM =
+      PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
+
+  MPM.run(M, MAM);
+}
 
 int main(int argc, char **argv) {
   InitLLVM Init{argc, argv};
@@ -153,6 +301,8 @@ int main(int argc, char **argv) {
       static_cast<LLVMTargetMachine *>(Target->createTargetMachine(
           TargetTriple, TargetCPU, TargetFeatures, TargetOptions, std::nullopt,
           std::nullopt, Opt)));
+  M->setTargetTriple(TargetMachine->getTargetTriple().getTriple());
+  M->setDataLayout(TargetMachine->createDataLayout());
 
   legacy::PassManager PM;
   TargetLibraryInfoImpl TLII(Triple{TargetTriple});
@@ -171,11 +321,28 @@ int main(int argc, char **argv) {
   PassConfig->setInitialized();
   // PM.add(createPrintMIRPass(errs()));
   Module NewM(M->getName(), Context);
-  PM.add(new RISCVLiftPass(*M, NewM));
+  NewM.setTargetTriple(M->getTargetTriple());
+  NewM.setDataLayout(M->getDataLayout());
+  PM.add(new RISCVLiftPass(*M, NewM,
+                           StringRef{TargetTriple}.contains("64") ? 64 : 32));
 
   PM.run(*M);
+  runOpt(NewM);
+  if (verifyModule(NewM, &errs()))
+    return EXIT_FAILURE;
 
-  NewM.dump();
+  std::error_code EC;
+  auto Out =
+      std::make_unique<ToolOutputFile>(OutputFilename, EC, sys::fs::OF_None);
+  if (EC) {
+    errs() << EC.message() << '\n';
+    return EXIT_FAILURE;
+  }
+
+  NewM.setTargetTriple("");
+  // TODO: attach MIR
+  NewM.print(Out->os(), nullptr);
+  Out->keep();
 
   return EXIT_SUCCESS;
 }
