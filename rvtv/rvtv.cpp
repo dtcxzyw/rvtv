@@ -360,6 +360,16 @@ struct RISCVLiftPass : public MachineFunctionPass {
           SetGPR(SExt(Builder.CreateBinOp(Opcode, TruncW(1), SImmW(2))));
         };
 
+        auto Shift = [&](Instruction::BinaryOps Opcode) {
+          SetGPR(Builder.CreateBinOp(Opcode, GetOperand(1),
+                                     Builder.CreateAnd(GetOperand(2), 63)));
+        };
+
+        auto ShiftW = [&](Instruction::BinaryOps Opcode) {
+          SetGPR(SExt(Builder.CreateBinOp(Opcode, TruncW(1),
+                                          Builder.CreateAnd(TruncW(2), 31))));
+        };
+
         auto ICmp = [&](CmpInst::Predicate Predicate, Value *LHS, Value *RHS) {
           SetGPR(ZExt(Builder.CreateICmp(Predicate, LHS, RHS)));
         };
@@ -575,16 +585,16 @@ struct RISCVLiftPass : public MachineFunctionPass {
           BinOpXLen(Instruction::Xor);
           break;
         case RISCV::SLL:
-          BinOpXLen(Instruction::Shl);
+          Shift(Instruction::Shl);
           break;
         case RISCV::SRL:
-          BinOpXLen(Instruction::LShr);
+          Shift(Instruction::LShr);
           break;
         case RISCV::SUB:
           BinOpXLen(Instruction::Sub);
           break;
         case RISCV::SRA:
-          BinOpXLen(Instruction::AShr);
+          Shift(Instruction::AShr);
           break;
         case RISCV::BEQ:
           BranchICmp(ICmpInst::ICMP_EQ);
@@ -639,13 +649,13 @@ struct RISCVLiftPass : public MachineFunctionPass {
           BinOpW(Instruction::Sub);
           break;
         case RISCV::SLLW:
-          BinOpW(Instruction::Shl);
+          ShiftW(Instruction::Shl);
           break;
         case RISCV::SRLW:
-          BinOpW(Instruction::LShr);
+          ShiftW(Instruction::LShr);
           break;
         case RISCV::SRAW:
-          BinOpW(Instruction::AShr);
+          ShiftW(Instruction::AShr);
           break;
         case RISCV::LWU:
           Load(Builder.getInt32Ty(), /*IsSigned=*/false);
