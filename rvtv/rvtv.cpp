@@ -13,7 +13,8 @@
     limitations under the License.
 */
 
-#include <llvm-19/llvm/ADT/FloatingPointMode.h>
+#include <llvm/ADT/FloatingPointMode.h>
+#include <llvm/ADT/STLExtras.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/CodeGen/ISDOpcodes.h>
 #include <llvm/CodeGen/MIRPrinter.h>
@@ -29,7 +30,9 @@
 #include <llvm/IR/AssemblyAnnotationWriter.h>
 #include <llvm/IR/Attributes.h>
 #include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/Constant.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/DataLayout.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/GlobalValue.h>
@@ -71,10 +74,11 @@
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/TargetParser/Host.h>
+#include <llvm/Transforms/Utils/Local.h>
+#include <llvm/lib/Target/RISCV/RISCV.h>
 #include <llvm/lib/Target/RISCV/RISCVInstrInfo.h>
 #include <llvm/lib/Target/RISCV/RISCVRegisterInfo.h>
 #include <llvm/lib/Target/RISCV/RISCVSubtarget.h>
-#include "RISCV.h"
 #include <cstdlib>
 #include <string>
 
@@ -180,31 +184,38 @@ struct RISCVLiftPass : public MachineFunctionPass {
       return false;
     }
     // skip functions with libcall
-    bool HasLibCall = false;
     for (auto &MBB : MF) {
       for (auto &MI : MBB) {
         if (MI.getOpcode() == RISCV::ADJCALLSTACKDOWN ||
             MI.getOpcode() == RISCV::ADJCALLSTACKUP ||
             MI.getOpcode() == RISCV::PseudoTAIL ||
             MI.getOpcode() == RISCV::PseudoCALL) {
-          HasLibCall = true;
-          break;
+          errs() << "Unsupported function with libcall: " << MF.getName()
+                 << '\n';
+          return false;
         }
       }
     }
 
-    if (HasLibCall) {
-      errs() << "Unsupported function with libcall: " << MF.getName() << '\n';
-      return false;
-    }
+    // skip functions with inttoptr
+    using namespace PatternMatch;
+    for (auto &BB : *RefF)
+      for (auto &I : BB)
+        if (I.getOpcode() == Instruction::IntToPtr ||
+            (I.getOpcode() == Instruction::GetElementPtr &&
+             match(cast<GetElementPtrInst>(I).getPointerOperand(), m_Zero()))) {
+          errs() << "Unsupported function with inttoptr: " << MF.getName()
+                 << '\n';
+          return false;
+        }
 
     auto *F = cast<Function>(
         M.getOrInsertFunction(MF.getName(), RefF->getFunctionType())
             .getCallee());
     F->copyAttributesFrom(RefF);
 
-    MF.print(errs());
-    errs() << '\n';
+    // MF.print(errs());
+    // errs() << '\n';
 
     MachineRegisterInfo &MRI = MF.getRegInfo();
     const TargetRegisterInfo &TRI = *static_cast<const RISCVRegisterInfo *>(
@@ -245,7 +256,7 @@ struct RISCVLiftPass : public MachineFunctionPass {
       auto *XLenTy = Builder.getIntNTy(XLen);
 
       for (auto &MI : MBB) {
-        errs() << MI << '\n';
+        // errs() << MI << '\n';
 
         auto GetOperand = [&](uint32_t Id) -> Value * {
           auto &Reg = MI.getOperand(Id);
@@ -917,6 +928,300 @@ struct RISCVLiftPass : public MachineFunctionPass {
 
 char RISCVLiftPass::ID;
 
+static void decomposeAddSubTree(Value *V, DenseMap<Value *, int32_t> &Row,
+                                APInt &C, bool Add) {
+  using namespace PatternMatch;
+  const APInt *RHSC;
+  if (match(V, m_APInt(RHSC))) {
+    if (Add)
+      C += *RHSC;
+    else
+      C -= *RHSC;
+    return;
+  }
+
+  Value *A, *B;
+  if (match(V, m_AddLike(m_Value(A), m_Value(B)))) {
+    decomposeAddSubTree(A, Row, C, Add);
+    decomposeAddSubTree(B, Row, C, Add);
+    return;
+  }
+
+  uint64_t X;
+  if (match(V, m_Shl(m_Value(A), m_ConstantInt(X)))) {
+    if (Add)
+      Row[A] += 1 << X;
+    else
+      Row[A] -= 1 << X;
+    return;
+  }
+
+  if (match(V, m_Sub(m_Value(A), m_Value(B)))) {
+    decomposeAddSubTree(A, Row, C, Add);
+    decomposeAddSubTree(B, Row, C, !Add);
+    return;
+  }
+
+  Row[V] += Add ? 1 : -1;
+}
+
+struct MaybePtr_match {
+  Value *&ResV;
+  uint64_t PtrSize;
+
+  explicit MaybePtr_match(const DataLayout &DL, Value *&V)
+      : ResV(V), PtrSize(DL.getPointerSizeInBits()) {}
+
+  template <typename OpTy> bool match(OpTy *V) {
+    if (auto *O = dyn_cast<Instruction>(V)) {
+      DenseMap<Value *, int32_t> Row;
+      APInt C(PtrSize, 0);
+      decomposeAddSubTree(O, Row, C, /*Add=*/true);
+
+      for (auto &[Val, Coeff] : Row)
+        if (isa<PtrToIntInst>(Val) && Coeff >= 1) {
+          ResV = V;
+          return true;
+        }
+    }
+    return false;
+  }
+};
+
+static MaybePtr_match m_MaybePtr(const DataLayout &DL, Value *&V) {
+  return MaybePtr_match{DL, V};
+}
+
+static bool canonicalize(Function &F) {
+  using namespace PatternMatch;
+  bool Changed = false;
+
+  auto &DL = F.getParent()->getDataLayout();
+
+  for (auto &BB : F)
+    for (auto &I : make_early_inc_range(BB)) {
+
+      if (RecursivelyDeleteTriviallyDeadInstructions(&I))
+        continue;
+
+      Value *A, *B, *C;
+      if (match(&I, m_IntToPtr(m_c_Add(m_PtrToIntSameSize(DL, m_Value(A)),
+                                       m_Value(B))))) {
+        IRBuilder<> Builder(&I);
+        I.replaceAllUsesWith(Builder.CreatePtrAdd(A, B));
+        I.eraseFromParent();
+        Changed = true;
+        continue;
+      }
+      if (match(&I, m_IntToPtr(m_Sub(m_Value(A), m_Value(B))))) {
+        IRBuilder<> Builder(&I);
+        I.replaceAllUsesWith(
+            Builder.CreatePtrAdd(Builder.CreateIntToPtr(A, Builder.getPtrTy()),
+                                 Builder.CreateNeg(B)));
+        I.eraseFromParent();
+        Changed = true;
+        continue;
+      }
+      if (match(&I, m_IntToPtr(m_c_Add(
+                        m_c_Add(m_PtrToIntSameSize(DL, m_Value(A)), m_Value(B)),
+                        m_Value(C))))) {
+        IRBuilder<> Builder(&I);
+        I.replaceAllUsesWith(Builder.CreatePtrAdd(A, Builder.CreateAdd(B, C)));
+        I.eraseFromParent();
+        Changed = true;
+        continue;
+      }
+      if (match(&I, m_IntToPtr(m_Select(m_Value(A), m_Value(B), m_Value(C))))) {
+        IRBuilder<> Builder(&I);
+        auto *DstTy = I.getType();
+        I.replaceAllUsesWith(
+            Builder.CreateSelect(A, Builder.CreateIntToPtr(B, DstTy),
+                                 Builder.CreateIntToPtr(C, DstTy)));
+        I.eraseFromParent();
+        Changed = true;
+        continue;
+      }
+      if (match(&I, m_Select(m_Value(A), m_PtrToIntSameSize(DL, m_Value(B)),
+                             m_Zero()))) {
+        IRBuilder<> Builder(&I);
+        auto *DstTy = I.getType();
+        I.replaceAllUsesWith(Builder.CreatePtrToInt(
+            Builder.CreateSelect(A, B, Constant::getNullValue(B->getType())),
+            DstTy));
+        I.eraseFromParent();
+        Changed = true;
+        continue;
+      }
+      if (match(&I, m_Select(m_Value(A), m_Zero(),
+                             m_PtrToIntSameSize(DL, m_Value(B))))) {
+        IRBuilder<> Builder(&I);
+        auto *DstTy = I.getType();
+        I.replaceAllUsesWith(Builder.CreatePtrToInt(
+            Builder.CreateSelect(A, Constant::getNullValue(B->getType()), B),
+            DstTy));
+        I.eraseFromParent();
+        Changed = true;
+        continue;
+      }
+
+      if (match(&I, m_IntToPtr(m_UMax(m_Value(A), m_Value(B))))) {
+        IRBuilder<> Builder(&I);
+        auto *AP = Builder.CreateIntToPtr(A, I.getType());
+        auto *BP = Builder.CreateIntToPtr(B, I.getType());
+        I.replaceAllUsesWith(
+            Builder.CreateSelect(Builder.CreateICmpUGT(AP, BP), AP, BP));
+        I.eraseFromParent();
+        Changed = true;
+        continue;
+      }
+
+      if (match(&I, m_IntToPtr(m_UMin(m_Value(A), m_Value(B))))) {
+        IRBuilder<> Builder(&I);
+        auto *AP = Builder.CreateIntToPtr(A, I.getType());
+        auto *BP = Builder.CreateIntToPtr(B, I.getType());
+        I.replaceAllUsesWith(
+            Builder.CreateSelect(Builder.CreateICmpULT(AP, BP), AP, BP));
+        I.eraseFromParent();
+        Changed = true;
+        continue;
+      }
+
+      const APInt *RHSC;
+      if (match(&I, m_IntToPtr(m_And(m_Value(A), m_APInt(RHSC))))) {
+        IRBuilder<> Builder(&I);
+        auto *PtrTy = Builder.getPtrTy();
+        auto *IntTy = Builder.getIntNTy(RHSC->getBitWidth());
+        I.replaceAllUsesWith(
+            Builder.CreateIntrinsic(Intrinsic::ptrmask, {PtrTy, IntTy},
+                                    {Builder.CreateIntToPtr(A, PtrTy),
+                                     ConstantInt::get(IntTy, *RHSC)}));
+        I.eraseFromParent();
+        Changed = true;
+        continue;
+      }
+      if (match(&I, m_IntToPtr(m_c_And(m_MaybePtr(DL, A), m_Value(B))))) {
+        IRBuilder<> Builder(&I);
+        auto *PtrTy = Builder.getPtrTy();
+        auto *IntTy = B->getType();
+        I.replaceAllUsesWith(
+            Builder.CreateIntrinsic(Intrinsic::ptrmask, {PtrTy, IntTy},
+                                    {Builder.CreateIntToPtr(A, PtrTy), B}));
+        I.eraseFromParent();
+        Changed = true;
+        continue;
+      }
+
+      if (match(&I, m_IntToPtr(m_Value(A)))) {
+        DenseMap<Value *, int32_t> Row;
+        APInt C(DL.getPointerSizeInBits(), 0);
+        decomposeAddSubTree(A, Row, C, /*Add=*/true);
+        if (Row.size() > 1 ||
+            (Row.size() == 1 && (!C.isZero() || Row.begin()->second != 1))) {
+          Value *Base = nullptr;
+          for (auto &[V, Coeff] : Row)
+            if (Coeff >= 1 && match(V, m_PtrToIntSameSize(DL, m_Value(B)))) {
+              Base = B;
+              Coeff -= 1;
+              break;
+            }
+          IRBuilder<> Builder(&I);
+          if (!Base) {
+            Value *Candidate = nullptr;
+            uint32_t Weight = 0;
+            auto GetWeight = [](Value *X) {
+              if (isa<SelectInst>(X))
+                return 4;
+              if (match(X, m_MaxOrMin(m_Value(), m_Value())))
+                return 3;
+              if (match(X, m_And(m_Value(), m_Value())))
+                return 2;
+              if (isa<Argument>(X))
+                return 1;
+              return 0;
+            };
+
+            for (auto &[V, Coeff] : Row)
+              if (Coeff >= 1 && !isa<Constant>(V)) {
+                auto NewWeight = GetWeight(V);
+                if (Weight < NewWeight) {
+                  Candidate = V;
+                  Weight = NewWeight;
+                }
+              }
+
+            if (Candidate) {
+              Base = Builder.CreateIntToPtr(Candidate, Builder.getPtrTy());
+              Row[Candidate] -= 1;
+            }
+          }
+          if (Base) {
+            Value *Offset = ConstantInt::get(F.getContext(), C);
+            for (auto &[V, Coeff] : Row) {
+              if (Coeff == 0)
+                continue;
+              if (Coeff == 1) {
+                Offset = Builder.CreateAdd(Offset, V);
+                continue;
+              }
+              if (Coeff == -1) {
+                Offset = Builder.CreateSub(Offset, V);
+                continue;
+              }
+              Offset = Builder.CreateAdd(
+                  Offset, Builder.CreateMul(
+                              V, ConstantInt::get(Offset->getType(), Coeff)));
+            }
+            auto *Ptr = Builder.CreatePtrAdd(Base, Offset);
+            I.replaceAllUsesWith(Ptr);
+            I.eraseFromParent();
+            Changed = true;
+            continue;
+          }
+        }
+      }
+    }
+
+  return Changed;
+}
+
+static bool canonicalize(Module &M) {
+  bool Changed = false;
+  for (auto &F : M) {
+    if (F.empty())
+      continue;
+    while (canonicalize(F))
+      Changed = true;
+  }
+  if (Changed) {
+    assert(!verifyModule(M, &errs()));
+    // M.dump();
+  }
+  return Changed;
+}
+
+static void verifyCanonicalization(Module &M) {
+  using namespace PatternMatch;
+  for (auto &F : M) {
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        switch (I.getOpcode()) {
+        // case Instruction::Load:
+        case Instruction::IntToPtr:
+          if (!isa<Argument>(I.getOperand(0)) &&
+              // or disjoint
+              !match(I.getOperand(0), m_Or(m_Value(), m_Value()))) {
+            errs() << F << '\n';
+            llvm_unreachable("Unsupported instruction");
+          }
+          break;
+        default:
+          break;
+        }
+      }
+    }
+  }
+}
+
 static void runOpt(Module &M) {
   llvm::LoopAnalysisManager LAM;
   llvm::FunctionAnalysisManager FAM;
@@ -933,7 +1238,6 @@ static void runOpt(Module &M) {
   llvm::ModulePassManager MPM =
       PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
 
-  // TODO: canonicalize ptrtoint/inttoptr -> ptradd
   MPM.run(M, MAM);
 }
 
@@ -1002,10 +1306,13 @@ int main(int argc, char **argv) {
 
   PM.run(*M);
 
-  NewM.dump();
+  // NewM.dump();
   if (verifyModule(NewM, &errs()))
     return EXIT_FAILURE;
   runOpt(NewM);
+  if (canonicalize(NewM))
+    runOpt(NewM);
+  verifyCanonicalization(NewM);
   if (verifyModule(NewM, &errs()))
     return EXIT_FAILURE;
 
