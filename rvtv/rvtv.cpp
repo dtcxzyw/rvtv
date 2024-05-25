@@ -13,17 +13,19 @@
     limitations under the License.
 */
 
-#include <llvm-19/llvm/CodeGen/MachineBasicBlock.h>
-#include <llvm-19/llvm/IR/Instruction.h>
+#include <llvm-19/llvm/ADT/FloatingPointMode.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/CodeGen/ISDOpcodes.h>
 #include <llvm/CodeGen/MIRPrinter.h>
 #include <llvm/CodeGen/MachineBasicBlock.h>
+#include <llvm/CodeGen/MachineConstantPool.h>
 #include <llvm/CodeGen/MachineFunction.h>
 #include <llvm/CodeGen/MachineFunctionPass.h>
+#include <llvm/CodeGen/MachineMemOperand.h>
 #include <llvm/CodeGen/MachineModuleInfo.h>
 #include <llvm/CodeGen/Passes.h>
 #include <llvm/CodeGen/TargetPassConfig.h>
+#include <llvm/IR/Argument.h>
 #include <llvm/IR/AssemblyAnnotationWriter.h>
 #include <llvm/IR/Attributes.h>
 #include <llvm/IR/BasicBlock.h>
@@ -31,6 +33,7 @@
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/GlobalValue.h>
+#include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/InstVisitor.h>
 #include <llvm/IR/InstrTypes.h>
@@ -70,7 +73,10 @@
 #include <llvm/TargetParser/Host.h>
 #include <llvm/lib/Target/RISCV/RISCVInstrInfo.h>
 #include <llvm/lib/Target/RISCV/RISCVRegisterInfo.h>
+#include <llvm/lib/Target/RISCV/RISCVSubtarget.h>
+#include "RISCV.h"
 #include <cstdlib>
+#include <string>
 
 using namespace llvm;
 
@@ -104,6 +110,7 @@ struct RISCVLiftPass : public MachineFunctionPass {
   Module &RefM;
   Module &M;
   uint32_t XLen;
+  uint32_t GlobalCount;
 
   explicit RISCVLiftPass(Module &RefM, Module &M, uint32_t XLen)
       : MachineFunctionPass(ID), RefM(RefM), M(M), XLen(XLen) {}
@@ -123,6 +130,9 @@ struct RISCVLiftPass : public MachineFunctionPass {
     if (RC == &RISCV::GPRRegClass)
       return Type::getIntNTy(M.getContext(), XLen);
 
+    if (RC == &RISCV::FPR16RegClass)
+      return Type::getHalfTy(M.getContext());
+
     if (RC == &RISCV::FPR32RegClass)
       return Type::getFloatTy(M.getContext());
 
@@ -130,6 +140,18 @@ struct RISCVLiftPass : public MachineFunctionPass {
       return Type::getDoubleTy(M.getContext());
 
     llvm_unreachable("Unsupported register class");
+  }
+
+  bool isValidType(const RISCVSubtarget &ST, const Type *Ty) {
+    if (!Ty->isSingleValueType())
+      return false;
+    if (Ty->isIntegerTy() && Ty->getScalarSizeInBits() > XLen)
+      return false;
+
+    if (Ty->isHalfTy() && !ST.hasStdExtZfh())
+      return false;
+
+    return true;
   }
 
   bool runOnMachineFunction(MachineFunction &MF) override {
@@ -144,6 +166,38 @@ struct RISCVLiftPass : public MachineFunctionPass {
       return true;
     }
 
+    auto &SubTarget = MF.getSubtarget<RISCVSubtarget>();
+
+    // skip functions with unsupported types
+    if (!isValidType(SubTarget, RefF->getReturnType()) ||
+        any_of(RefF->args(),
+               [&](Argument &Arg) {
+                 return !isValidType(SubTarget, Arg.getType());
+               }) ||
+        RefF->isVarArg()) {
+      errs() << "Unsupported function signature: " << *RefF->getFunctionType()
+             << '\n';
+      return false;
+    }
+    // skip functions with libcall
+    bool HasLibCall = false;
+    for (auto &MBB : MF) {
+      for (auto &MI : MBB) {
+        if (MI.getOpcode() == RISCV::ADJCALLSTACKDOWN ||
+            MI.getOpcode() == RISCV::ADJCALLSTACKUP ||
+            MI.getOpcode() == RISCV::PseudoTAIL ||
+            MI.getOpcode() == RISCV::PseudoCALL) {
+          HasLibCall = true;
+          break;
+        }
+      }
+    }
+
+    if (HasLibCall) {
+      errs() << "Unsupported function with libcall: " << MF.getName() << '\n';
+      return false;
+    }
+
     auto *F = cast<Function>(
         M.getOrInsertFunction(MF.getName(), RefF->getFunctionType())
             .getCallee());
@@ -155,6 +209,18 @@ struct RISCVLiftPass : public MachineFunctionPass {
     MachineRegisterInfo &MRI = MF.getRegInfo();
     const TargetRegisterInfo &TRI = *static_cast<const RISCVRegisterInfo *>(
         MF.getSubtarget().getRegisterInfo());
+
+    auto *ConstantPool = MF.getConstantPool();
+    SmallVector<Value *> Constants;
+    for (auto &Entry : ConstantPool->getConstants()) {
+      assert(!Entry.isMachineConstantPoolEntry());
+      auto *Val = const_cast<Constant *>(Entry.Val.ConstVal);
+      auto Name = "constantpool" + std::to_string(GlobalCount++);
+      Constants.push_back(M.getOrInsertGlobal(Name, Val->getType(), [&] {
+        return new GlobalVariable(M, Val->getType(), /*isConstant=*/true,
+                                  GlobalValue::InternalLinkage, Val, Name);
+      }));
+    }
 
     DenseMap<MachineBasicBlock *, BasicBlock *> BBMap;
 
@@ -176,8 +242,11 @@ struct RISCVLiftPass : public MachineFunctionPass {
       auto *BB = BBMap.at(&MBB);
       IRBuilder<> Builder(BB);
       DenseMap<Register, Value *> RetMap;
+      auto *XLenTy = Builder.getIntNTy(XLen);
 
       for (auto &MI : MBB) {
+        errs() << MI << '\n';
+
         auto GetOperand = [&](uint32_t Id) -> Value * {
           auto &Reg = MI.getOperand(Id);
           assert(Reg.isUse() && "Operand is not a use");
@@ -206,26 +275,22 @@ struct RISCVLiftPass : public MachineFunctionPass {
           return Builder.CreateTrunc(GetOperand(Id), Builder.getInt32Ty());
         };
 
-        auto SExt = [&](Value *Val) {
-          return Builder.CreateSExt(Val, Builder.getIntNTy(XLen));
-        };
+        auto SExt = [&](Value *Val) { return Builder.CreateSExt(Val, XLenTy); };
 
-        auto ZExt = [&](Value *Val) {
-          return Builder.CreateZExt(Val, Builder.getIntNTy(XLen));
-        };
+        auto ZExt = [&](Value *Val) { return Builder.CreateZExt(Val, XLenTy); };
 
         auto Ext = [&](Value *Val, bool IsSigned) {
-          return Builder.CreateIntCast(Val, Builder.getIntNTy(XLen), IsSigned);
+          return Builder.CreateIntCast(Val, XLenTy, IsSigned);
         };
 
         // auto UImm = [&](uint32_t Id) {
-        //   return ConstantInt::get(Builder.getIntNTy(XLen),
+        //   return ConstantInt::get(XLenTy,
         //                           APInt(XLen, MI.getOperand(Id).getImm(),
         //                                 /*isSigned=*/false));
         // };
 
         auto SImm = [&](uint32_t Id) {
-          return ConstantInt::get(Builder.getIntNTy(XLen),
+          return ConstantInt::get(XLenTy,
                                   APInt(XLen, MI.getOperand(Id).getImm(),
                                         /*isSigned=*/true));
         };
@@ -252,6 +317,11 @@ struct RISCVLiftPass : public MachineFunctionPass {
           errs() << "Unsupported cast from " << *SrcTy << " to " << *DstTy
                  << '\n';
           llvm_unreachable("Unsupported cast");
+        };
+
+        auto GetType = [&](uint32_t Id) {
+          return getTypeFromRegClass(
+              MRI.getRegClass(MI.getOperand(Id).getReg()));
         };
 
         auto BinOp = [&](Instruction::BinaryOps Opcode, Value *LHS,
@@ -283,26 +353,65 @@ struct RISCVLiftPass : public MachineFunctionPass {
           SetGPR(ZExt(Builder.CreateICmp(Predicate, LHS, RHS)));
         };
 
-        auto BranchICmp = [&](CmpInst::Predicate Pred, Value *LHS, Value *RHS) {
-          auto *Cond = Builder.CreateICmp(Pred, LHS, RHS);
+        auto FCmp = [&](CmpInst::Predicate Predicate) {
+          SetGPR(ZExt(
+              Builder.CreateFCmp(Predicate, GetOperand(1), GetOperand(2))));
+        };
+
+        auto BranchICmp = [&](CmpInst::Predicate Pred) {
+          auto *Cond = Builder.CreateICmp(Pred, GetOperand(0), GetOperand(1));
           auto *TrueBB = BBMap.at(MI.getOperand(2).getMBB());
           auto *FalseBB = BBMap.at(MBB.getNextNode());
           Builder.CreateCondBr(Cond, TrueBB, FalseBB);
         };
 
         auto Mul2XLen = [&](bool Signed1, bool Signed2) {
-          auto *Ty = Builder.getIntNTy(XLen);
           auto *DoubleTy = Builder.getIntNTy(XLen * 2);
           auto *LHS = Builder.CreateIntCast(GetOperand(1), DoubleTy, Signed1);
           auto *RHS = Builder.CreateIntCast(GetOperand(2), DoubleTy, Signed2);
           SetGPR(Builder.CreateTrunc(
-              Builder.CreateLShr(Builder.CreateMul(LHS, RHS), XLen), Ty));
+              Builder.CreateLShr(Builder.CreateMul(LHS, RHS), XLen), XLenTy));
         };
 
         auto Load = [&](Type *Ty, bool IsSigned) {
           auto &Offset = MI.getOperand(2);
           auto &Base = MI.getOperand(1);
-          // SetGPR(Ext(Builder.getIntN(XLen, 0), IsSigned));
+
+          if (Offset.isCPI()) {
+            auto &Entry = ConstantPool->getConstants()[Offset.getIndex()];
+            assert(!Entry.isMachineConstantPoolEntry());
+            SetGPR(Builder.CreateIntCast(
+                const_cast<Constant *>(Entry.Val.ConstVal), XLenTy, IsSigned));
+            return;
+          }
+
+          auto *BasePtr =
+              Builder.CreateIntToPtr(GetOperand(1), Builder.getPtrTy());
+          auto *Ptr = Builder.CreatePtrAdd(
+              BasePtr, Offset.isImm()
+                           ? ConstantInt::get(XLenTy, Offset.getImm())
+                           : GetOperand(2));
+          SetGPR(Ext(Builder.CreateLoad(Ty, Ptr), IsSigned));
+        };
+
+        auto FPLoad = [&] {
+          auto &Offset = MI.getOperand(2);
+          auto &Base = MI.getOperand(1);
+
+          if (Offset.isCPI()) {
+            auto &Entry = ConstantPool->getConstants()[Offset.getIndex()];
+            assert(!Entry.isMachineConstantPoolEntry());
+            SetFPR(const_cast<Constant *>(Entry.Val.ConstVal));
+            return;
+          }
+
+          auto *BasePtr =
+              Builder.CreateIntToPtr(GetOperand(1), Builder.getPtrTy());
+          auto *Ptr = Builder.CreatePtrAdd(
+              BasePtr, Offset.isImm()
+                           ? ConstantInt::get(XLenTy, Offset.getImm())
+                           : GetOperand(2));
+          SetFPR(Builder.CreateLoad(GetType(0), Ptr));
         };
 
         switch (MI.getOpcode()) {
@@ -324,14 +433,16 @@ struct RISCVLiftPass : public MachineFunctionPass {
             uint32_t FPRCount = 0;
 
             for (auto &Arg : F->args()) {
-              if (Id == RISCV::X10 + GPRCount)
+              if (Id == RISCV::X10 + GPRCount && Arg.getType()->isIntOrPtrTy())
                 Val = &Arg;
-              if (Id == RISCV::F10_F + FPRCount)
-                Val = &Arg;
-              if (Id == RISCV::F10_D + FPRCount)
-                Val = &Arg;
-              if (Id == RISCV::F10_H + FPRCount)
-                Val = &Arg;
+              if (Arg.getType()->isFloatingPointTy()) {
+                if (Id == RISCV::F10_F + FPRCount)
+                  Val = &Arg;
+                if (Id == RISCV::F10_D + FPRCount)
+                  Val = &Arg;
+                if (Id == RISCV::F10_H + FPRCount)
+                  Val = &Arg;
+              }
               if (Val)
                 break;
 
@@ -350,8 +461,8 @@ struct RISCVLiftPass : public MachineFunctionPass {
 
           if (Dst.getReg().isPhysical()) {
             auto Id = Dst.getReg().id();
-            if (Id >= RISCV::X10 && Id <= RISCV::X31)
-              TgtTy = Builder.getIntNTy(XLen);
+            if (Id >= RISCV::X0 && Id <= RISCV::X31)
+              TgtTy = XLenTy;
             else if (Id >= RISCV::F10_F && Id <= RISCV::F31_F)
               TgtTy = Builder.getFloatTy();
             else if (Id >= RISCV::F10_D && Id <= RISCV::F31_D)
@@ -385,13 +496,28 @@ struct RISCVLiftPass : public MachineFunctionPass {
           }
           break;
         }
+        case RISCV::PseudoBR: {
+          auto *DstBB = BBMap.at(MI.getOperand(0).getMBB());
+          if (!BB->empty() && BB->back().isTerminator()) {
+            if (auto *Br = dyn_cast<BranchInst>(BB->getTerminator())) {
+              if (Br->isConditional() && Br->getSuccessor(1) == DstBB)
+                break;
+            }
+          }
+          Builder.CreateBr(DstBB);
+          break;
+        }
         // RV32I Base
         case RISCV::LUI:
-          SetGPR(ConstantInt::get(Builder.getIntNTy(XLen),
-                                  MI.getOperand(1).getImm() << 12));
+          if (MI.getOperand(1).isImm())
+            SetGPR(ConstantInt::get(XLenTy, MI.getOperand(1).getImm() << 12));
           break;
         case RISCV::ADDI:
-          BinOpXLenImm(Instruction::Add);
+          if (MI.getOperand(2).isImm())
+            BinOpXLenImm(Instruction::Add);
+          else if (MI.getOperand(2).isCPI())
+            SetGPR(Builder.CreatePtrToInt(
+                Constants[MI.getOperand(2).getIndex()], XLenTy));
           break;
         case RISCV::SLTI:
           ICmp(CmpInst::ICMP_SLT, GetOperand(1), SImm(2));
@@ -448,22 +574,22 @@ struct RISCVLiftPass : public MachineFunctionPass {
           BinOpXLen(Instruction::AShr);
           break;
         case RISCV::BEQ:
-          BranchICmp(ICmpInst::ICMP_EQ, GetOperand(0), GetOperand(1));
+          BranchICmp(ICmpInst::ICMP_EQ);
           break;
         case RISCV::BNE:
-          BranchICmp(ICmpInst::ICMP_NE, GetOperand(0), GetOperand(1));
+          BranchICmp(ICmpInst::ICMP_NE);
           break;
         case RISCV::BLT:
-          BranchICmp(ICmpInst::ICMP_SLT, GetOperand(0), GetOperand(1));
+          BranchICmp(ICmpInst::ICMP_SLT);
           break;
         case RISCV::BGE:
-          BranchICmp(ICmpInst::ICMP_SGE, GetOperand(0), GetOperand(1));
+          BranchICmp(ICmpInst::ICMP_SGE);
           break;
         case RISCV::BLTU:
-          BranchICmp(ICmpInst::ICMP_ULT, GetOperand(0), GetOperand(1));
+          BranchICmp(ICmpInst::ICMP_ULT);
           break;
         case RISCV::BGEU:
-          BranchICmp(ICmpInst::ICMP_UGE, GetOperand(0), GetOperand(1));
+          BranchICmp(ICmpInst::ICMP_UGE);
           break;
         case RISCV::LB:
           Load(Builder.getInt8Ty(), /*IsSigned=*/true);
@@ -542,7 +668,24 @@ struct RISCVLiftPass : public MachineFunctionPass {
         case RISCV::DIVUW:
           BinOpW(Instruction::UDiv);
           break;
-        // F
+        case RISCV::REM:
+          BinOpXLen(Instruction::SRem);
+          break;
+        case RISCV::REMU:
+          BinOpXLen(Instruction::URem);
+          break;
+        case RISCV::REMW:
+          BinOpW(Instruction::SRem);
+          break;
+        case RISCV::REMUW:
+          BinOpW(Instruction::URem);
+          break;
+        // F/D/ZFH
+        case RISCV::FLH:
+        case RISCV::FLW:
+        case RISCV::FLD:
+          FPLoad();
+          break;
         case RISCV::FMV_W_X:
           SetFPR(Builder.CreateBitCast(TruncW(1), Builder.getFloatTy()));
           break;
@@ -550,22 +693,200 @@ struct RISCVLiftPass : public MachineFunctionPass {
           SetGPR(
               SExt(Builder.CreateBitCast(GetOperand(1), Builder.getInt32Ty())));
           break;
+        case RISCV::FMV_X_D:
+          SetGPR(Builder.CreateBitCast(GetOperand(1), Builder.getInt64Ty()));
+          break;
+        case RISCV::FMV_D_X:
+          SetFPR(Builder.CreateBitCast(GetOperand(1), Builder.getDoubleTy()));
+          break;
+        case RISCV::FCVT_W_H:
+        case RISCV::FCVT_W_S:
+        case RISCV::FCVT_W_D:
+          SetGPR(
+              SExt(Builder.CreateFPToSI(GetOperand(1), Builder.getInt32Ty())));
+          break;
+        case RISCV::FCVT_WU_H:
+        case RISCV::FCVT_WU_S:
+        case RISCV::FCVT_WU_D:
+          SetGPR(
+              SExt(Builder.CreateFPToUI(GetOperand(1), Builder.getInt32Ty())));
+          break;
+        case RISCV::FCVT_L_H:
+        case RISCV::FCVT_L_S:
+        case RISCV::FCVT_L_D:
+          SetGPR(Builder.CreateFPToSI(GetOperand(1), Builder.getInt64Ty()));
+          break;
+        case RISCV::FCVT_LU_H:
+        case RISCV::FCVT_LU_S:
+        case RISCV::FCVT_LU_D:
+          SetGPR(Builder.CreateFPToUI(GetOperand(1), Builder.getInt64Ty()));
+          break;
+        case RISCV::FCVT_S_W:
+          SetFPR(Builder.CreateSIToFP(TruncW(1), Builder.getFloatTy()));
+          break;
+        case RISCV::FCVT_S_L:
+          SetFPR(Builder.CreateSIToFP(GetOperand(1), Builder.getFloatTy()));
+          break;
+        case RISCV::FCVT_S_WU:
+          SetFPR(Builder.CreateUIToFP(TruncW(1), Builder.getFloatTy()));
+          break;
+        case RISCV::FCVT_S_LU:
+          SetFPR(Builder.CreateUIToFP(GetOperand(1), Builder.getFloatTy()));
+          break;
+        case RISCV::FCVT_D_W:
+          SetFPR(Builder.CreateSIToFP(TruncW(1), Builder.getDoubleTy()));
+          break;
+        case RISCV::FCVT_D_L:
+          SetFPR(Builder.CreateSIToFP(GetOperand(1), Builder.getDoubleTy()));
+          break;
+        case RISCV::FCVT_D_WU:
+          SetFPR(Builder.CreateUIToFP(TruncW(1), Builder.getDoubleTy()));
+          break;
+        case RISCV::FCVT_D_LU:
+          SetFPR(Builder.CreateUIToFP(GetOperand(1), Builder.getDoubleTy()));
+          break;
+        case RISCV::FCVT_D_S:
+          SetFPR(Builder.CreateFPExt(GetOperand(1), Builder.getDoubleTy()));
+          break;
+        case RISCV::FCVT_S_D:
+          SetFPR(Builder.CreateFPTrunc(GetOperand(1), Builder.getFloatTy()));
+          break;
+        case RISCV::FADD_H:
         case RISCV::FADD_S:
+        case RISCV::FADD_D:
           FPBinOp(Instruction::FAdd);
           break;
+        case RISCV::FSUB_H:
         case RISCV::FSUB_S:
+        case RISCV::FSUB_D:
           FPBinOp(Instruction::FSub);
           break;
+        case RISCV::FMUL_H:
         case RISCV::FMUL_S:
+        case RISCV::FMUL_D:
           FPBinOp(Instruction::FMul);
           break;
+        case RISCV::FDIV_H:
         case RISCV::FDIV_S:
+        case RISCV::FDIV_D:
           FPBinOp(Instruction::FDiv);
+          break;
+        case RISCV::FLT_H:
+        case RISCV::FLT_S:
+        case RISCV::FLT_D:
+          FCmp(CmpInst::FCMP_OLT);
+          break;
+        case RISCV::FLE_H:
+        case RISCV::FLE_S:
+        case RISCV::FLE_D:
+          FCmp(CmpInst::FCMP_OLE);
+          break;
+        case RISCV::FEQ_H:
+        case RISCV::FEQ_S:
+        case RISCV::FEQ_D:
+          FCmp(CmpInst::FCMP_OEQ);
+          break;
+        case RISCV::FMADD_H:
+        case RISCV::FMADD_S:
+        case RISCV::FMADD_D:
+          SetFPR(Builder.CreateIntrinsic(
+              GetType(0), Intrinsic::fma,
+              {GetOperand(1), GetOperand(2), GetOperand(3)}));
+          break;
+        case RISCV::FNMADD_H:
+        case RISCV::FNMADD_S:
+        case RISCV::FNMADD_D:
+          SetFPR(Builder.CreateFNeg(Builder.CreateIntrinsic(
+              GetType(0), Intrinsic::fma,
+              {GetOperand(1), GetOperand(2), GetOperand(3)})));
+          break;
+        case RISCV::FMSUB_H:
+        case RISCV::FMSUB_S:
+        case RISCV::FMSUB_D:
+          SetFPR(Builder.CreateIntrinsic(GetType(0), Intrinsic::fma,
+                                         {GetOperand(1), GetOperand(2),
+                                          Builder.CreateFNeg(GetOperand(3))}));
+          break;
+        case RISCV::FNMSUB_H:
+        case RISCV::FNMSUB_S:
+        case RISCV::FNMSUB_D:
+          SetFPR(Builder.CreateFNeg(
+              Builder.CreateIntrinsic(GetType(0), Intrinsic::fma,
+                                      {GetOperand(1), GetOperand(2),
+                                       Builder.CreateFNeg(GetOperand(3))})));
+          break;
+        case RISCV::FSGNJ_H:
+        case RISCV::FSGNJ_S:
+        case RISCV::FSGNJ_D:
+          SetFPR(Builder.CreateCopySign(GetOperand(1), GetOperand(2)));
+          break;
+        case RISCV::FSGNJX_H:
+        case RISCV::FSGNJX_S:
+        case RISCV::FSGNJX_D: {
+          auto *LHS = GetOperand(1);
+          auto *RHS = GetOperand(2);
+
+          // fabs idiom
+          if (LHS == RHS) {
+            SetFPR(Builder.CreateUnaryIntrinsic(Intrinsic::fabs, LHS));
+            break;
+          }
+
+          llvm_unreachable("todo");
+          break;
+        }
+        case RISCV::FSGNJN_H:
+        case RISCV::FSGNJN_S:
+        case RISCV::FSGNJN_D: {
+          auto *LHS = GetOperand(1);
+          auto *RHS = GetOperand(2);
+
+          // fneg idiom
+          if (LHS == RHS) {
+            SetFPR(Builder.CreateFNeg(LHS));
+            break;
+          }
+
+          SetFPR(Builder.CreateCopySign(LHS, Builder.CreateFNeg(RHS)));
+          break;
+        }
+        case RISCV::FCLASS_H:
+        case RISCV::FCLASS_S:
+        case RISCV::FCLASS_D: {
+          auto *Val = GetOperand(1);
+          Value *Res = Builder.getIntN(XLen, 1ULL << 0); // fcNegInf
+          auto TestClass = [&](FPClassTest Test, uint32_t Bit) {
+            Res = Builder.CreateSelect(Builder.createIsFPClass(Val, Test),
+                                       Builder.getIntN(XLen, 1U << Bit), Res);
+          };
+          TestClass(fcNegNormal, 1);
+          TestClass(fcNegSubnormal, 2);
+          TestClass(fcNegZero, 3);
+          TestClass(fcPosZero, 4);
+          TestClass(fcPosSubnormal, 5);
+          TestClass(fcPosNormal, 6);
+          TestClass(fcPosInf, 7);
+          TestClass(fcSNan, 8);
+          TestClass(fcQNan, 9);
+          SetGPR(Res);
+          break;
+        }
+        case RISCV::FMAX_H:
+        case RISCV::FMAX_S:
+        case RISCV::FMAX_D:
+          SetFPR(Builder.CreateBinaryIntrinsic(Intrinsic::maxnum, GetOperand(1),
+                                               GetOperand(2)));
+          break;
+        case RISCV::FMIN_H:
+        case RISCV::FMIN_S:
+        case RISCV::FMIN_D:
+          SetFPR(Builder.CreateBinaryIntrinsic(Intrinsic::minnum, GetOperand(1),
+                                               GetOperand(2)));
           break;
 
         default:
           errs() << "Unsupported opcode: " << MI << '\n';
-          return true;
+          llvm_unreachable("Unsupported opcode");
         }
       }
 

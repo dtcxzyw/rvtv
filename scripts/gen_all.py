@@ -5,6 +5,7 @@ import tqdm
 
 rvtv_exec = sys.argv[1]
 dataset = sys.argv[2]
+skip = int(sys.argv[3])
 
 def test(file):
     try:
@@ -20,7 +21,11 @@ for file in os.listdir(dataset):
         work_list.append(path)
 
 count = 0
-for file in tqdm.tqdm(work_list):
+skip_count = 0
+for file in tqdm.tqdm(work_list,maxinterval=1,mininterval=0.5,smoothing=0.99):
+    skip_count += 1
+    if skip_count < skip:
+        continue
     if test(file):
         count += 1
     else:
