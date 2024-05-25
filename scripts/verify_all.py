@@ -14,7 +14,7 @@ def test(file):
     try:
         name = os.path.basename(file)
         tgt = os.path.join(output, name)
-        cmd = [alive_tv, '--smt-to=100', '--disable-undef-input', '--disable-poison-input', file, tgt]
+        cmd = [alive_tv, '--smt-to=100', '--disable-undef-input', '--disable-poison-input', tgt + ".src", tgt]
         out = subprocess.check_output(cmd).decode('utf-8')
         if "Transformation doesn't verify!" in out:
             print(' '.join(cmd))

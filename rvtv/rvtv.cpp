@@ -521,7 +521,9 @@ struct RISCVLiftPass : public MachineFunctionPass {
         // RV32I Base
         case RISCV::LUI:
           if (MI.getOperand(1).isImm())
-            SetGPR(ConstantInt::get(XLenTy, MI.getOperand(1).getImm() << 12));
+            SetGPR(SExt(Builder.CreateTrunc(
+                ConstantInt::get(XLenTy, MI.getOperand(1).getImm() << 12),
+                Builder.getInt32Ty())));
           break;
         case RISCV::ADDI:
           if (MI.getOperand(2).isImm())
@@ -1328,6 +1330,18 @@ int main(int argc, char **argv) {
   // TODO: attach MIR
   NewM.print(Out->os(), nullptr);
   Out->keep();
+
+  if (OutputFilename != "-") {
+    auto SrcOut = std::make_unique<ToolOutputFile>(OutputFilename + ".src", EC,
+                                                   sys::fs::OF_None);
+    if (EC) {
+      errs() << EC.message() << '\n';
+      return EXIT_FAILURE;
+    }
+    M->setTargetTriple("");
+    M->print(SrcOut->os(), nullptr);
+    SrcOut->keep();
+  }
 
   return EXIT_SUCCESS;
 }
