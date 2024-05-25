@@ -2,20 +2,26 @@ import os
 import subprocess
 import sys
 import tqdm
-import shutil
 
-rvtv_exec = sys.argv[1]
+alive_tv = sys.argv[1]
 dataset = sys.argv[2]
 output = "output"
 
-if os.path.exists(output):
-    shutil.rmtree(output)
-os.makedirs(output)
+if not os.path.exists(output):
+    exit(1)
 
 def test(file):
     try:
         name = os.path.basename(file)
-        subprocess.check_call([rvtv_exec, file, '--mattr=+m,+a,+f,+d,+c', '-o', os.path.join(output, name)], stderr=subprocess.DEVNULL,stdout=subprocess.DEVNULL)
+        tgt = os.path.join(output, name)
+        cmd = [alive_tv, '--smt-to=100', '--disable-undef-input', '--disable-poison-input', file, tgt]
+        out = subprocess.check_output(cmd).decode('utf-8')
+        if "Transformation doesn't verify!" in out:
+            print(' '.join(cmd))
+            return False
+        if out.count("ERROR: Timeout") != out.count("ERROR:"):
+            print(' '.join(cmd))
+            return False
         return True
     except:
         return False
