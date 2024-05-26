@@ -548,9 +548,9 @@ struct RISCVLiftPass : public MachineFunctionPass {
         auto Pack = [&](uint32_t Size) {
           uint32_t Half = Size / 2;
           auto *HalfTy = Builder.getIntNTy(Half);
-          auto *Lo = Builder.CreateTrunc(GetOperand(1), HalfTy);
-          auto *Hi = Builder.CreateTrunc(GetOperand(2), HalfTy);
-          SetGPR(ZExt(Builder.CreateOr(Builder.CreateShl(Hi, Half), Lo)));
+          auto *Lo = ZExt(Builder.CreateTrunc(GetOperand(1), HalfTy));
+          auto *Hi = ZExt(Builder.CreateTrunc(GetOperand(2), HalfTy));
+          SetGPR(Builder.CreateOr(Builder.CreateShl(Hi, Half), Lo));
         };
 
         switch (MI.getOpcode()) {
