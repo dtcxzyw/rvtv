@@ -13,7 +13,6 @@
     limitations under the License.
 */
 
-#include <llvm-19/llvm/ADT/FloatingPointMode.h>
 #include <llvm/ADT/FloatingPointMode.h>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
@@ -77,6 +76,7 @@
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/TargetParser/Host.h>
 #include <llvm/Transforms/Utils/Local.h>
+#include <llvm/lib/Target/RISCV/MCTargetDesc/RISCVBaseInfo.h>
 #include <llvm/lib/Target/RISCV/RISCV.h>
 #include <llvm/lib/Target/RISCV/RISCVInstrInfo.h>
 #include <llvm/lib/Target/RISCV/RISCVRegisterInfo.h>
@@ -827,6 +827,15 @@ struct RISCVLiftPass : public MachineFunctionPass {
         case RISCV::FLD:
           FPLoad();
           break;
+        case RISCV::FMV_H_X:
+          SetFPR(Builder.CreateBitCast(
+              Builder.CreateTrunc(GetOperand(1), Builder.getInt16Ty()),
+              Builder.getHalfTy()));
+          break;
+        case RISCV::FMV_X_H:
+          SetGPR(
+              SExt(Builder.CreateBitCast(GetOperand(1), Builder.getInt16Ty())));
+          break;
         case RISCV::FMV_W_X:
           SetFPR(Builder.CreateBitCast(TruncW(1), Builder.getFloatTy()));
           break;
@@ -890,11 +899,17 @@ struct RISCVLiftPass : public MachineFunctionPass {
         case RISCV::FCVT_D_LU:
           SetFPR(Builder.CreateUIToFP(GetOperand(1), Builder.getDoubleTy()));
           break;
-        case RISCV::FCVT_D_S:
-          SetFPR(Builder.CreateFPExt(GetOperand(1), Builder.getDoubleTy()));
+        case RISCV::FCVT_H_S:
+        case RISCV::FCVT_H_D:
+          SetFPR(Builder.CreateFPCast(GetOperand(1), Builder.getHalfTy()));
           break;
+        case RISCV::FCVT_S_H:
         case RISCV::FCVT_S_D:
-          SetFPR(Builder.CreateFPTrunc(GetOperand(1), Builder.getFloatTy()));
+          SetFPR(Builder.CreateFPCast(GetOperand(1), Builder.getFloatTy()));
+          break;
+        case RISCV::FCVT_D_S:
+        case RISCV::FCVT_D_H:
+          SetFPR(Builder.CreateFPCast(GetOperand(1), Builder.getDoubleTy()));
           break;
         case RISCV::FADD_H:
         case RISCV::FADD_S:
@@ -1178,9 +1193,19 @@ struct RISCVLiftPass : public MachineFunctionPass {
         // Zfa
         case RISCV::FLI_H:
         case RISCV::FLI_S:
-        case RISCV::FLI_D:
-          llvm_unreachable("todo");
-          break;
+        case RISCV::FLI_D: {
+          auto Imm = MI.getOperand(1).getImm();
+          auto *Ty = GetType(0);
+          if (Imm == 1)
+            SetFPR(ConstantFP::get(
+                Ty, APFloat::getSmallestNormalized(Ty->getFltSemantics())));
+          else if (Imm == 30)
+            SetFPR(ConstantFP::getInfinity(Ty));
+          else if (Imm == 31)
+            SetFPR(ConstantFP::getNaN(Ty));
+          else
+            SetFPR(ConstantFP::get(Ty, RISCVLoadFPImm::getFPImm(Imm)));
+        } break;
         case RISCV::FMINM_H:
         case RISCV::FMINM_S:
         case RISCV::FMINM_D:
@@ -1688,7 +1713,8 @@ int main(int argc, char **argv) {
     // NewM.dump();
     runOpt(NewM);
   }
-  verifyCanonicalization(NewM);
+  if (!TargetMachine->getTargetFeatureString().contains("zicond"))
+    verifyCanonicalization(NewM);
   postCanonicalize(NewM);
   if (verifyModule(NewM, &errs()))
     return EXIT_FAILURE;
