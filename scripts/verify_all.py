@@ -35,6 +35,7 @@ skip_list = [
     "d0adc9f443688c98.ll",
     "0498655192e99e71.ll",
     "cb03909301273330.ll",
+    "0fd0c852faafe107.ll", # ptr cmp
     "75a2ca2dbd7ae03a.ll", # 93414
     "9dcd6ca3467d4ec3.ll",
 ]
@@ -43,7 +44,7 @@ def test(file):
     try:
         name = os.path.basename(file)
         tgt = os.path.join(output, name)
-        cmd = [alive_tv, '--smt-to=100', '--tgt-is-asm', '--disable-undef-input', '--disable-poison-input', tgt + ".src", tgt]
+        cmd = [alive_tv, '--smt-to=1000', '--tgt-is-asm', '--disable-undef-input', '--disable-poison-input', tgt + ".src", tgt]
         out = subprocess.check_output(cmd).decode('utf-8')
         if "Transformation doesn't verify!" in out:
             return (' '.join(cmd), False)

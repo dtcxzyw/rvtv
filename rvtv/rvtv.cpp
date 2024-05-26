@@ -878,9 +878,10 @@ struct RISCVLiftPass : public MachineFunctionPass {
         case RISCV::FNMADD_H:
         case RISCV::FNMADD_S:
         case RISCV::FNMADD_D:
-          SetFPR(Builder.CreateFNeg(Builder.CreateIntrinsic(
-              GetType(0), Intrinsic::fma,
-              {GetOperand(1), GetOperand(2), GetOperand(3)})));
+          SetFPR(Builder.CreateIntrinsic(GetType(0), Intrinsic::fma,
+                                         {GetOperand(1),
+                                          Builder.CreateFNeg(GetOperand(2)),
+                                          Builder.CreateFNeg(GetOperand(3))}));
           break;
         case RISCV::FMSUB_H:
         case RISCV::FMSUB_S:
@@ -892,10 +893,10 @@ struct RISCVLiftPass : public MachineFunctionPass {
         case RISCV::FNMSUB_H:
         case RISCV::FNMSUB_S:
         case RISCV::FNMSUB_D:
-          SetFPR(Builder.CreateFNeg(
-              Builder.CreateIntrinsic(GetType(0), Intrinsic::fma,
-                                      {GetOperand(1), GetOperand(2),
-                                       Builder.CreateFNeg(GetOperand(3))})));
+          SetFPR(Builder.CreateIntrinsic(GetType(0), Intrinsic::fma,
+                                         {GetOperand(1),
+                                          Builder.CreateFNeg(GetOperand(2)),
+                                          GetOperand(3)}));
           break;
         case RISCV::FSGNJ_H:
         case RISCV::FSGNJ_S:
