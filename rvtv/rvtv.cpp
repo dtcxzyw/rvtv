@@ -13,6 +13,7 @@
     limitations under the License.
 */
 
+#include <llvm-19/llvm/ADT/FloatingPointMode.h>
 #include <llvm/ADT/FloatingPointMode.h>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
@@ -47,6 +48,7 @@
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/NoFolder.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/PatternMatch.h>
 #include <llvm/IR/User.h>
@@ -435,6 +437,59 @@ struct RISCVLiftPass : public MachineFunctionPass {
           SetFPR(Builder.CreateLoad(GetType(0), Ptr));
         };
 
+        auto FMinMax = [&](Intrinsic::ID BaseIID, Intrinsic::ID ZeroIID) {
+          auto *LHS = GetOperand(1);
+          auto *RHS = GetOperand(2);
+          auto *BaseRes = Builder.CreateBinaryIntrinsic(BaseIID, LHS, RHS);
+          auto *ZeroRes = Builder.CreateBinaryIntrinsic(ZeroIID, LHS, RHS);
+          auto *Cond = Builder.CreateAnd(Builder.createIsFPClass(LHS, fcZero),
+                                         Builder.createIsFPClass(RHS, fcZero));
+          SetFPR(Builder.CreateSelect(Cond, ZeroRes, BaseRes));
+        };
+
+        auto Div = [&](bool IsSigned, Value *LHS, Value *RHS) {
+          auto *IsZero = Builder.CreateIsNull(RHS);
+          auto *SignedMin = ConstantInt::get(
+              LHS->getType(),
+              APInt::getSignedMinValue(LHS->getType()->getScalarSizeInBits()));
+          auto *AllOnes = Constant::getAllOnesValue(LHS->getType());
+
+          auto *IsOverflow =
+              IsSigned ? Builder.CreateAnd(Builder.CreateICmpEQ(LHS, SignedMin),
+                                           Builder.CreateICmpEQ(RHS, AllOnes))
+                       : Builder.getFalse();
+          auto *SafeRHS =
+              Builder.CreateSelect(Builder.CreateOr(IsZero, IsOverflow),
+                                   ConstantInt::get(RHS->getType(), 1), RHS);
+          auto *Div = Builder.CreateBinOp(
+              IsSigned ? Instruction::SDiv : Instruction::UDiv, LHS, SafeRHS);
+          Div = Builder.CreateSelect(IsZero, AllOnes, Div);
+          Div = Builder.CreateSelect(IsOverflow, SignedMin, Div);
+          return Div;
+        };
+
+        auto Rem = [&](bool IsSigned, Value *LHS, Value *RHS) {
+          auto *IsZero = Builder.CreateIsNull(RHS);
+          auto *SignedMin = ConstantInt::get(
+              LHS->getType(),
+              APInt::getSignedMinValue(LHS->getType()->getScalarSizeInBits()));
+          auto *AllOnes = Constant::getAllOnesValue(LHS->getType());
+
+          auto *IsOverflow =
+              IsSigned ? Builder.CreateAnd(Builder.CreateICmpEQ(LHS, SignedMin),
+                                           Builder.CreateICmpEQ(RHS, AllOnes))
+                       : Builder.getFalse();
+          auto *SafeRHS =
+              Builder.CreateSelect(Builder.CreateOr(IsZero, IsOverflow),
+                                   ConstantInt::get(RHS->getType(), 1), RHS);
+          auto *Rem = Builder.CreateBinOp(
+              IsSigned ? Instruction::SRem : Instruction::URem, LHS, SafeRHS);
+          Rem = Builder.CreateSelect(IsZero, LHS, Rem);
+          Rem = Builder.CreateSelect(
+              IsOverflow, Constant::getNullValue(LHS->getType()), Rem);
+          return Rem;
+        };
+
         switch (MI.getOpcode()) {
           // Pseudos
         case TargetOpcode::PHI:
@@ -680,28 +735,28 @@ struct RISCVLiftPass : public MachineFunctionPass {
           Mul2XLen(/*Signed1=*/false, /*Signed2=*/false);
           break;
         case RISCV::DIV:
-          BinOpXLen(Instruction::SDiv);
+          SetGPR(Div(/*IsSigned=*/true, GetOperand(1), GetOperand(2)));
           break;
         case RISCV::DIVU:
-          BinOpXLen(Instruction::UDiv);
+          SetGPR(Div(/*IsSigned=*/false, GetOperand(1), GetOperand(2)));
           break;
         case RISCV::DIVW:
-          BinOpW(Instruction::SDiv);
+          SetGPR(SExt(Div(/*IsSigned=*/true, TruncW(1), TruncW(2))));
           break;
         case RISCV::DIVUW:
-          BinOpW(Instruction::UDiv);
+          SetGPR(SExt(Div(/*IsSigned=*/false, TruncW(1), TruncW(2))));
           break;
         case RISCV::REM:
-          BinOpXLen(Instruction::SRem);
+          SetGPR(Rem(/*IsSigned=*/true, GetOperand(1), GetOperand(2)));
           break;
         case RISCV::REMU:
-          BinOpXLen(Instruction::URem);
+          SetGPR(Rem(/*IsSigned=*/false, GetOperand(1), GetOperand(2)));
           break;
         case RISCV::REMW:
-          BinOpW(Instruction::SRem);
+          SetGPR(SExt(Rem(/*IsSigned=*/true, TruncW(1), TruncW(2))));
           break;
         case RISCV::REMUW:
-          BinOpW(Instruction::URem);
+          SetGPR(SExt(Rem(/*IsSigned=*/false, TruncW(1), TruncW(2))));
           break;
         // F/D/ZFH
         case RISCV::FLH:
@@ -722,27 +777,31 @@ struct RISCVLiftPass : public MachineFunctionPass {
         case RISCV::FMV_D_X:
           SetFPR(Builder.CreateBitCast(GetOperand(1), Builder.getDoubleTy()));
           break;
+        // FIXME: See Table 28. Domains of float-to-integer conversions and
+        // behavior for invalid inputs
         case RISCV::FCVT_W_H:
         case RISCV::FCVT_W_S:
         case RISCV::FCVT_W_D:
-          SetGPR(
-              SExt(Builder.CreateFPToSI(GetOperand(1), Builder.getInt32Ty())));
+          SetGPR(SExt(Builder.CreateFreeze(
+              Builder.CreateFPToSI(GetOperand(1), Builder.getInt32Ty()))));
           break;
         case RISCV::FCVT_WU_H:
         case RISCV::FCVT_WU_S:
         case RISCV::FCVT_WU_D:
-          SetGPR(
-              SExt(Builder.CreateFPToUI(GetOperand(1), Builder.getInt32Ty())));
+          SetGPR(SExt(Builder.CreateFreeze(
+              Builder.CreateFPToUI(GetOperand(1), Builder.getInt32Ty()))));
           break;
         case RISCV::FCVT_L_H:
         case RISCV::FCVT_L_S:
         case RISCV::FCVT_L_D:
-          SetGPR(Builder.CreateFPToSI(GetOperand(1), Builder.getInt64Ty()));
+          SetGPR(Builder.CreateFreeze(
+              Builder.CreateFPToSI(GetOperand(1), Builder.getInt64Ty())));
           break;
         case RISCV::FCVT_LU_H:
         case RISCV::FCVT_LU_S:
         case RISCV::FCVT_LU_D:
-          SetGPR(Builder.CreateFPToUI(GetOperand(1), Builder.getInt64Ty()));
+          SetGPR(Builder.CreateFreeze(
+              Builder.CreateFPToUI(GetOperand(1), Builder.getInt64Ty())));
           break;
         case RISCV::FCVT_S_W:
           SetFPR(Builder.CreateSIToFP(TruncW(1), Builder.getFloatTy()));
@@ -897,14 +956,12 @@ struct RISCVLiftPass : public MachineFunctionPass {
         case RISCV::FMAX_H:
         case RISCV::FMAX_S:
         case RISCV::FMAX_D:
-          SetFPR(Builder.CreateBinaryIntrinsic(Intrinsic::maxnum, GetOperand(1),
-                                               GetOperand(2)));
+          FMinMax(Intrinsic::maxnum, Intrinsic::maximum);
           break;
         case RISCV::FMIN_H:
         case RISCV::FMIN_S:
         case RISCV::FMIN_D:
-          SetFPR(Builder.CreateBinaryIntrinsic(Intrinsic::minnum, GetOperand(1),
-                                               GetOperand(2)));
+          FMinMax(Intrinsic::minnum, Intrinsic::minimum);
           break;
 
         default:
@@ -960,7 +1017,7 @@ static void decomposeAddSubTree(Value *V, DenseMap<Value *, int32_t> &Row,
   }
 
   uint64_t X;
-  if (match(V, m_Shl(m_Value(A), m_ConstantInt(X)))) {
+  if (match(V, m_Shl(m_Value(A), m_ConstantInt(X))) && X <= 15) {
     if (Add)
       Row[A] += 1 << X;
     else
@@ -1211,6 +1268,48 @@ static bool canonicalize(Module &M) {
   return Changed;
 }
 
+static bool postCanonicalize(Function &F) {
+  using namespace PatternMatch;
+  bool Changed = false;
+
+  for (auto &BB : F)
+    for (auto &I : make_early_inc_range(BB)) {
+      IRBuilder<NoFolder> Builder(&I);
+      for (auto &Op : I.operands()) {
+        Constant *C;
+        if (match(Op.get(), m_IntToPtr(m_ImmConstant(C)))) {
+          Op.set(
+              Builder.CreatePtrAdd(Constant::getNullValue(Op->getType()), C));
+          Changed = true;
+        }
+      }
+
+      Value *X;
+      if (match(&I, m_IntToPtr(m_Value(X)))) {
+        auto *V = Builder.CreatePtrAdd(Constant::getNullValue(I.getType()), X);
+        I.replaceAllUsesWith(V);
+        I.eraseFromParent();
+        Changed = true;
+      }
+    }
+
+  return Changed;
+}
+
+static bool postCanonicalize(Module &M) {
+  bool Changed = false;
+  for (auto &F : M) {
+    if (F.empty())
+      continue;
+    Changed |= postCanonicalize(F);
+  }
+  if (Changed) {
+    assert(!verifyModule(M, &errs()));
+    // M.dump();
+  }
+  return Changed;
+}
+
 static void verifyCanonicalization(Module &M) {
   using namespace PatternMatch;
   for (auto &F : M) {
@@ -1322,9 +1421,13 @@ int main(int argc, char **argv) {
   if (verifyModule(NewM, &errs()))
     return EXIT_FAILURE;
   runOpt(NewM);
-  if (canonicalize(NewM))
+  // NewM.dump();
+  if (canonicalize(NewM)) {
+    // NewM.dump();
     runOpt(NewM);
+  }
   verifyCanonicalization(NewM);
+  postCanonicalize(NewM);
   if (verifyModule(NewM, &errs()))
     return EXIT_FAILURE;
 

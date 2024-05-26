@@ -3,6 +3,7 @@ import subprocess
 import sys
 import tqdm
 import shutil
+from multiprocessing import Pool
 
 rvtv_exec = sys.argv[1]
 dataset = sys.argv[2]
@@ -16,9 +17,9 @@ def test(file):
     try:
         name = os.path.basename(file)
         subprocess.check_call([rvtv_exec, file, '--mattr=+m,+a,+f,+d,+c', '-o', os.path.join(output, name)], stderr=subprocess.DEVNULL,stdout=subprocess.DEVNULL)
-        return True
+        return (file, True)
     except:
-        return False
+        return (file, False)
     
 work_list = []
 for file in os.listdir(dataset):
@@ -26,11 +27,16 @@ for file in os.listdir(dataset):
         path = os.path.join(dataset, file)
         work_list.append(path)
 
-count = 0
-for file in tqdm.tqdm(work_list,maxinterval=1,mininterval=0.5,smoothing=0.99):
-    if test(file):
-        count += 1
+progress = tqdm.tqdm(work_list,maxinterval=1,mininterval=0.5,smoothing=0.99)
+pool = Pool(processes=16)
+
+for file, res in pool.imap_unordered(test, work_list):
+    progress.update()
+    if res:
+        pass
     else:
         # pass
         print('Failed', file)
         sys.exit(1)
+
+progress.close()
