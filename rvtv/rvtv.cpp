@@ -490,6 +490,69 @@ struct RISCVLiftPass : public MachineFunctionPass {
           return Rem;
         };
 
+        auto CZero = [&](ICmpInst::Predicate Pred) {
+          Value *Val = GetOperand(1);
+          Value *Cond = GetOperand(2);
+          Value *Zero = Constant::getNullValue(Cond->getType());
+          return Builder.CreateSelect(Builder.CreateICmp(Pred, Cond, Zero),
+                                      Zero, Val);
+        };
+
+        auto BinaryIntrinsicXLen = [&](Intrinsic::ID IID) {
+          SetGPR(
+              Builder.CreateBinaryIntrinsic(IID, GetOperand(1), GetOperand(2)));
+        };
+
+        auto ShXAdd = [&](uint32_t ShAmt, bool HasUW) {
+          SetGPR(Builder.CreateAdd(
+              GetOperand(2),
+              Builder.CreateShl(HasUW ? ZExt(TruncW(1)) : GetOperand(1),
+                                ShAmt)));
+        };
+
+        auto Rotate = [&](Intrinsic::ID IID, Value *X, Value *Y) {
+          return Builder.CreateIntrinsic(IID, {X->getType()}, {X, X, Y});
+        };
+
+        auto ClearBit = [&](Value *Shamt) {
+          auto *SafeShamt = Builder.CreateAnd(
+              Shamt, ConstantInt::get(Shamt->getType(), XLen - 1));
+          SetGPR(Builder.CreateAnd(GetOperand(1),
+                                   Builder.CreateNot(Builder.CreateShl(
+                                       Builder.getIntN(XLen, 1), SafeShamt))));
+        };
+
+        auto ExtractBit = [&](Value *Shamt) {
+          auto *SafeShamt = Builder.CreateAnd(
+              Shamt, ConstantInt::get(Shamt->getType(), XLen - 1));
+          SetGPR(Builder.CreateAnd(Builder.CreateLShr(GetOperand(1), SafeShamt),
+                                   1));
+        };
+
+        auto InvertBit = [&](Value *Shamt) {
+          auto *SafeShamt = Builder.CreateAnd(
+              Shamt, ConstantInt::get(Shamt->getType(), XLen - 1));
+          SetGPR(Builder.CreateXor(
+              GetOperand(1),
+              Builder.CreateShl(Builder.getIntN(XLen, 1), SafeShamt)));
+        };
+
+        auto SetBit = [&](Value *Shamt) {
+          auto *SafeShamt = Builder.CreateAnd(
+              Shamt, ConstantInt::get(Shamt->getType(), XLen - 1));
+          SetGPR(Builder.CreateOr(
+              GetOperand(1),
+              Builder.CreateShl(Builder.getIntN(XLen, 1), SafeShamt)));
+        };
+
+        auto Pack = [&](uint32_t Size) {
+          uint32_t Half = Size / 2;
+          auto *HalfTy = Builder.getIntNTy(Half);
+          auto *Lo = Builder.CreateTrunc(GetOperand(1), HalfTy);
+          auto *Hi = Builder.CreateTrunc(GetOperand(2), HalfTy);
+          SetGPR(ZExt(Builder.CreateOr(Builder.CreateShl(Hi, Half), Lo)));
+        };
+
         switch (MI.getOpcode()) {
           // Pseudos
         case TargetOpcode::PHI:
@@ -856,11 +919,17 @@ struct RISCVLiftPass : public MachineFunctionPass {
         case RISCV::FLT_H:
         case RISCV::FLT_S:
         case RISCV::FLT_D:
+        case RISCV::FLTQ_H:
+        case RISCV::FLTQ_S:
+        case RISCV::FLTQ_D:
           FCmp(CmpInst::FCMP_OLT);
           break;
         case RISCV::FLE_H:
         case RISCV::FLE_S:
         case RISCV::FLE_D:
+        case RISCV::FLEQ_H:
+        case RISCV::FLEQ_S:
+        case RISCV::FLEQ_D:
           FCmp(CmpInst::FCMP_OLE);
           break;
         case RISCV::FEQ_H:
@@ -963,6 +1032,198 @@ struct RISCVLiftPass : public MachineFunctionPass {
         case RISCV::FMIN_S:
         case RISCV::FMIN_D:
           FMinMax(Intrinsic::minnum, Intrinsic::minimum);
+          break;
+        // Zicond
+        case RISCV::CZERO_EQZ:
+          SetGPR(CZero(ICmpInst::ICMP_EQ));
+          break;
+        case RISCV::CZERO_NEZ:
+          SetGPR(CZero(ICmpInst::ICMP_NE));
+          break;
+        // Zba
+        case RISCV::ADD_UW:
+          SetGPR(Builder.CreateAdd(GetOperand(2), ZExt(TruncW(1))));
+          break;
+        case RISCV::SH1ADD:
+          ShXAdd(/*ShAmt=*/1, /*HasUW=*/false);
+          break;
+        case RISCV::SH1ADD_UW:
+          ShXAdd(/*ShAmt=*/1, /*HasUW=*/true);
+          break;
+        case RISCV::SH2ADD:
+          ShXAdd(/*ShAmt=*/2, /*HasUW=*/false);
+          break;
+        case RISCV::SH2ADD_UW:
+          ShXAdd(/*ShAmt=*/2, /*HasUW=*/true);
+          break;
+        case RISCV::SH3ADD:
+          ShXAdd(/*ShAmt=*/3, /*HasUW=*/false);
+          break;
+        case RISCV::SH3ADD_UW:
+          ShXAdd(/*ShAmt=*/3, /*HasUW=*/true);
+          break;
+        case RISCV::SLLI_UW:
+          SetGPR(Builder.CreateShl(ZExt(TruncW(1)), SImm(2)));
+          break;
+        // Zbb
+        case RISCV::ANDN:
+          SetGPR(Builder.CreateAnd(GetOperand(1),
+                                   Builder.CreateNot(GetOperand(2))));
+          break;
+        case RISCV::ORN:
+          SetGPR(Builder.CreateOr(GetOperand(1),
+                                  Builder.CreateNot(GetOperand(2))));
+          break;
+        case RISCV::XNOR:
+          SetGPR(Builder.CreateNot(
+              Builder.CreateXor(GetOperand(1), GetOperand(2))));
+          break;
+        case RISCV::CLZ:
+          SetGPR(Builder.CreateBinaryIntrinsic(Intrinsic::ctlz, GetOperand(1),
+                                               Builder.getFalse()));
+          break;
+        case RISCV::CLZW:
+          SetGPR(ZExt(Builder.CreateBinaryIntrinsic(Intrinsic::ctlz, TruncW(1),
+                                                    Builder.getFalse())));
+          break;
+        case RISCV::CTZ:
+          SetGPR(Builder.CreateBinaryIntrinsic(Intrinsic::cttz, GetOperand(1),
+                                               Builder.getFalse()));
+          break;
+        case RISCV::CTZW:
+          SetGPR(ZExt(Builder.CreateBinaryIntrinsic(Intrinsic::cttz, TruncW(1),
+                                                    Builder.getFalse())));
+          break;
+        case RISCV::CPOP:
+          SetGPR(Builder.CreateUnaryIntrinsic(Intrinsic::ctpop, GetOperand(1)));
+          break;
+        case RISCV::CPOPW:
+          SetGPR(
+              ZExt(Builder.CreateUnaryIntrinsic(Intrinsic::ctpop, TruncW(1))));
+          break;
+        case RISCV::MAX:
+          BinaryIntrinsicXLen(Intrinsic::smax);
+          break;
+        case RISCV::MAXU:
+          BinaryIntrinsicXLen(Intrinsic::umax);
+          break;
+        case RISCV::MIN:
+          BinaryIntrinsicXLen(Intrinsic::smin);
+          break;
+        case RISCV::MINU:
+          BinaryIntrinsicXLen(Intrinsic::umin);
+          break;
+        case RISCV::SEXT_B:
+          SetGPR(SExt(Builder.CreateTrunc(GetOperand(1), Builder.getInt8Ty())));
+          break;
+        case RISCV::SEXT_H:
+          SetGPR(
+              SExt(Builder.CreateTrunc(GetOperand(1), Builder.getInt16Ty())));
+          break;
+        case RISCV::ZEXT_H_RV32:
+        case RISCV::ZEXT_H_RV64:
+          SetGPR(
+              ZExt(Builder.CreateTrunc(GetOperand(1), Builder.getInt16Ty())));
+          break;
+        case RISCV::ROL:
+          SetGPR(Rotate(Intrinsic::fshl, GetOperand(1), GetOperand(2)));
+          break;
+        case RISCV::ROLW:
+          SetGPR(SExt(Rotate(Intrinsic::fshl, TruncW(1), TruncW(2))));
+          break;
+        case RISCV::ROR:
+          SetGPR(Rotate(Intrinsic::fshr, GetOperand(1), GetOperand(2)));
+          break;
+        case RISCV::RORW:
+          SetGPR(SExt(Rotate(Intrinsic::fshr, TruncW(1), TruncW(2))));
+          break;
+        case RISCV::RORI:
+          SetGPR(Rotate(Intrinsic::fshr, GetOperand(1), SImm(2)));
+          break;
+        case RISCV::RORIW:
+          SetGPR(SExt(Rotate(Intrinsic::fshr, TruncW(1), SImmW(2))));
+          break;
+        case RISCV::ORC_B:
+          llvm_unreachable("todo");
+          break;
+        case RISCV::REV8_RV32:
+        case RISCV::REV8_RV64:
+          SetGPR(Builder.CreateUnaryIntrinsic(Intrinsic::bswap, GetOperand(1)));
+          break;
+        // Zbs
+        case RISCV::BCLR:
+          ClearBit(GetOperand(2));
+          break;
+        case RISCV::BCLRI:
+          ClearBit(SImm(2));
+          break;
+        case RISCV::BEXT:
+          ExtractBit(GetOperand(2));
+          break;
+        case RISCV::BEXTI:
+          ExtractBit(SImm(2));
+          break;
+        case RISCV::BINV:
+          InvertBit(GetOperand(2));
+          break;
+        case RISCV::BINVI:
+          InvertBit(SImm(2));
+          break;
+        case RISCV::BSET:
+          SetBit(GetOperand(2));
+          break;
+        case RISCV::BSETI:
+          SetBit(SImm(2));
+          break;
+        // Zfa
+        case RISCV::FLI_H:
+        case RISCV::FLI_S:
+        case RISCV::FLI_D:
+          llvm_unreachable("todo");
+          break;
+        case RISCV::FMINM_H:
+        case RISCV::FMINM_S:
+        case RISCV::FMINM_D:
+          SetFPR(Builder.CreateBinaryIntrinsic(Intrinsic::minimum,
+                                               GetOperand(1), GetOperand(2)));
+          break;
+        case RISCV::FMAXM_H:
+        case RISCV::FMAXM_S:
+        case RISCV::FMAXM_D:
+          SetFPR(Builder.CreateBinaryIntrinsic(Intrinsic::maximum,
+                                               GetOperand(1), GetOperand(2)));
+          break;
+        case RISCV::FROUND_H:
+        case RISCV::FROUND_S:
+        case RISCV::FROUND_D:
+        case RISCV::FROUNDNX_H:
+        case RISCV::FROUNDNX_S:
+        case RISCV::FROUNDNX_D:
+          llvm_unreachable("todo");
+          break;
+        case RISCV::FCVTMOD_W_D:
+          llvm_unreachable("todo");
+          break;
+        case RISCV::FMVH_X_D:
+          llvm_unreachable("todo");
+          break;
+        case RISCV::FMVP_D_X:
+          llvm_unreachable("todo");
+          break;
+        // Zbkb
+        case RISCV::BREV8:
+          SetGPR(Builder.CreateUnaryIntrinsic(
+              Intrinsic::bswap, Builder.CreateUnaryIntrinsic(
+                                    Intrinsic::bitreverse, GetOperand(1))));
+          break;
+        case RISCV::PACK:
+          Pack(XLen);
+          break;
+        case RISCV::PACKH:
+          Pack(16);
+          break;
+        case RISCV::PACKW:
+          Pack(32);
           break;
 
         default:
