@@ -545,12 +545,16 @@ struct RISCVLiftPass : public MachineFunctionPass {
               Builder.CreateShl(Builder.getIntN(XLen, 1), SafeShamt)));
         };
 
-        auto Pack = [&](uint32_t Size) {
+        auto Pack = [&](uint32_t Size, bool IsSigned) {
           uint32_t Half = Size / 2;
+          auto *SizeTy = Builder.getIntNTy(Size);
           auto *HalfTy = Builder.getIntNTy(Half);
-          auto *Lo = ZExt(Builder.CreateTrunc(GetOperand(1), HalfTy));
-          auto *Hi = ZExt(Builder.CreateTrunc(GetOperand(2), HalfTy));
-          SetGPR(Builder.CreateOr(Builder.CreateShl(Hi, Half), Lo));
+          auto *Lo = Builder.CreateZExt(
+              Builder.CreateTrunc(GetOperand(1), HalfTy), SizeTy);
+          auto *Hi = Builder.CreateZExt(
+              Builder.CreateTrunc(GetOperand(2), HalfTy), SizeTy);
+          SetGPR(
+              Ext(Builder.CreateOr(Builder.CreateShl(Hi, Half), Lo), IsSigned));
         };
 
         switch (MI.getOpcode()) {
@@ -1242,13 +1246,13 @@ struct RISCVLiftPass : public MachineFunctionPass {
                                     Intrinsic::bitreverse, GetOperand(1))));
           break;
         case RISCV::PACK:
-          Pack(XLen);
+          Pack(XLen, /*IsSigned=*/false);
           break;
         case RISCV::PACKH:
-          Pack(16);
+          Pack(16, /*IsSigned=*/false);
           break;
         case RISCV::PACKW:
-          Pack(32);
+          Pack(32, /*IsSigned=*/true);
           break;
 
         default:
