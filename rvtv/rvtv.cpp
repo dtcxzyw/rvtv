@@ -650,6 +650,11 @@ struct RISCVLiftPass : public MachineFunctionPass {
           Builder.CreateBr(DstBB);
           break;
         }
+        case RISCV::PseudoMovAddr: {
+          SetGPR(Builder.CreatePtrToInt(Constants[MI.getOperand(1).getIndex()],
+                                        XLenTy));
+          break;
+        }
         // RV32I Base
         case RISCV::LUI:
           if (MI.getOperand(1).isImm())
