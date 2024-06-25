@@ -1167,9 +1167,20 @@ struct RISCVLiftPass : public MachineFunctionPass {
         case RISCV::RORIW:
           SetGPR(SExt(Rotate(Intrinsic::fshr, TruncW(1), SImmW(2))));
           break;
-        case RISCV::ORC_B:
-          llvm_unreachable("todo");
-          break;
+        case RISCV::ORC_B: {
+          Value *Input = GetOperand(1);
+          Value *Zero = Builder.getIntN(XLen, 0);
+          Value *Res = Zero;
+          Value *Mask = Builder.getIntN(XLen, 0xff);
+          for (uint32_t Idx = 0; Idx < XLen; Idx += 8) {
+            Value *MaskedValue = Builder.CreateAnd(Input, Mask);
+            Value *LogicalOr = Builder.CreateSelect(
+                Builder.CreateIsNull(MaskedValue), Zero, Mask);
+            Res = Builder.CreateOr(Res, LogicalOr);
+            Mask = Builder.CreateShl(Mask, 8);
+          }
+          SetGPR(Res);
+        } break;
         case RISCV::REV8_RV32:
         case RISCV::REV8_RV64:
           SetGPR(Builder.CreateUnaryIntrinsic(Intrinsic::bswap, GetOperand(1)));
