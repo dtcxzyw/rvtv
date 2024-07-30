@@ -33,6 +33,7 @@
 #include <llvm/IR/Constant.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DataLayout.h>
+#include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/GlobalValue.h>
@@ -1008,7 +1009,10 @@ struct RISCVLiftPass : public MachineFunctionPass {
             break;
           }
 
-          llvm_unreachable("todo");
+          auto *Sign = Builder.CreateIsNotNeg(Builder.CreateBitCast(
+              RHS, Builder.getIntNTy(RHS->getType()->getScalarSizeInBits())));
+          auto *Neg = Builder.CreateFNeg(LHS);
+          SetFPR(Builder.CreateSelect(Sign, LHS, Neg));
           break;
         }
         case RISCV::FSGNJN_H:
