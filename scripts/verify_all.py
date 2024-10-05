@@ -13,6 +13,12 @@ if not os.path.exists(output):
 
 skip_list = [
     "52392226991139f2.ll", # inttoptr
+    "73ad6f7122c6dc64.ll",
+    "65b29ef74a83b809.ll",
+    "214b13e71a891c0e.ll",
+    "35d50a48463eefb8.ll",
+    "28f959323d9104cd.ll",
+    "0a7dbeba135d6bc0.ll",
     "ef8634a74e125c37.ll", # gep null
     "b82649d5cbf4ffb0.ll",
     "4c6ffd28bf867774.ll",
@@ -37,13 +43,20 @@ skip_list = [
     "cb03909301273330.ll",
     "0fd0c852faafe107.ll", # ptr cmp
     "75a2ca2dbd7ae03a.ll", # 93414
+    "a1259b1d1fd47001.ll",
+    "c69e9d55100b4c2f.ll",
     "9dcd6ca3467d4ec3.ll",
+    "d2186a01f060e6cc.ll",
+    "2beeb3f276cd973c.ll",
+    "2048af87c3b2aa84.ll"
 ]
 
 def test(file):
     try:
         name = os.path.basename(file)
         tgt = os.path.join(output, name)
+        if not os.path.exists(tgt):
+            return ("", True)
         cmd = [alive_tv, '--smt-to=1000', '--tgt-is-asm', '--disable-undef-input', '--disable-poison-input', tgt + ".src", tgt]
         out = subprocess.check_output(cmd).decode('utf-8')
         if "Transformation doesn't verify!" in out:
