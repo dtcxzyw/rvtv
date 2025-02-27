@@ -1244,11 +1244,40 @@ struct RISCVLiftPass : public MachineFunctionPass {
           break;
         case RISCV::FROUND_H:
         case RISCV::FROUND_S:
-        case RISCV::FROUND_D:
+        case RISCV::FROUND_D: {
+          Intrinsic::ID IID;
+          switch (MI.getOperand(2).getImm()) {
+          case RISCVFPRndMode::DYN:
+            IID = Intrinsic::nearbyint;
+            break;
+          case RISCVFPRndMode::RMM:
+            IID = Intrinsic::round;
+            break;
+          case RISCVFPRndMode::RNE:
+            IID = Intrinsic::roundeven;
+            break;
+          case RISCVFPRndMode::RDN:
+            IID = Intrinsic::floor;
+            break;
+          case RISCVFPRndMode::RUP:
+            IID = Intrinsic::ceil;
+            break;
+          case RISCVFPRndMode::RTZ:
+            IID = Intrinsic::trunc;
+            break;
+          default:
+            llvm_unreachable("todo");
+            break;
+          }
+          SetFPR(Builder.CreateUnaryIntrinsic(IID, GetOperand(1)));
+          break;
+        }
         case RISCV::FROUNDNX_H:
         case RISCV::FROUNDNX_S:
         case RISCV::FROUNDNX_D:
-          llvm_unreachable("todo");
+          assert(MI.getOperand(2).getImm() == RISCVFPRndMode::DYN &&
+                 "Unsupported rounding mode");
+          SetFPR(Builder.CreateUnaryIntrinsic(Intrinsic::rint, GetOperand(1)));
           break;
         case RISCV::FCVTMOD_W_D:
           llvm_unreachable("todo");
@@ -1697,12 +1726,12 @@ int main(int argc, char **argv) {
 
   CodeGenOptLevel Opt = CodeGenOptLevel::Default;
   TargetOptions TargetOptions;
-  auto TargetMachine = std::unique_ptr<LLVMTargetMachine>(
-      static_cast<LLVMTargetMachine *>(Target->createTargetMachine(
-          TargetTriple, TargetCPU, TargetFeatures, TargetOptions, std::nullopt,
-          std::nullopt, Opt)));
-  M->setTargetTriple(TargetMachine->getTargetTriple().getTriple());
-  M->setDataLayout(TargetMachine->createDataLayout());
+  auto TM = std::unique_ptr<TargetMachine>(static_cast<TargetMachine *>(
+      Target->createTargetMachine(TargetTriple, TargetCPU, TargetFeatures,
+                                  TargetOptions, std::nullopt, std::nullopt,
+                                  Opt)));
+  M->setTargetTriple(TM->getTargetTriple().getTriple());
+  M->setDataLayout(TM->createDataLayout());
 
   legacy::PassManager PM;
   TargetLibraryInfoImpl TLII(Triple{TargetTriple});
@@ -1710,10 +1739,10 @@ int main(int argc, char **argv) {
   //   TargetMachine->addPassesToEmitFile(PM, errs(), nullptr,
   //                                      CodeGenFileType::AssemblyFile);
   //   PM.run(*M);
-  auto *PassConfig = TargetMachine->createPassConfig(PM);
+  auto *PassConfig = TM->createPassConfig(PM);
   PassConfig->setDisableVerify(true);
   PM.add(PassConfig);
-  PM.add(new MachineModuleInfoWrapperPass(TargetMachine.get()));
+  PM.add(new MachineModuleInfoWrapperPass(TM.get()));
 
   if (PassConfig->addISelPasses())
     return EXIT_FAILURE;
@@ -1737,7 +1766,7 @@ int main(int argc, char **argv) {
     // NewM.dump();
     runOpt(NewM);
   }
-  if (!TargetMachine->getTargetFeatureString().contains("zicond"))
+  if (!TM->getTargetFeatureString().contains("zicond"))
     verifyCanonicalization(NewM);
   postCanonicalize(NewM);
   if (verifyModule(NewM, &errs()))
